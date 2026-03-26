@@ -1,9 +1,16 @@
 import os
 import json
-import torch
 import random
-from transformers import pipeline as pipeline_function, AutoTokenizer, AutoModelForCausalLM, Pipeline
 from tqdm import tqdm
+
+try:
+    import torch
+    from transformers import pipeline as pipeline_function, AutoTokenizer, AutoModelForCausalLM, Pipeline
+    HAS_LOCAL_DEPS = True
+except ImportError:
+    HAS_LOCAL_DEPS = False
+    torch = None
+    Pipeline = None
 
 def _get_sorted_json_files(directory_path):
     try:
@@ -85,9 +92,11 @@ def _run_local_generation(model_obj, messages, model_family='llama'):
         return None
 
 
-def analyze_all_at_once_local(model_obj, directory_path: str, is_handcrafted: bool, model_family: str):
+def analyze_all_at_once_local(model_obj, directory_path: str, is_handcrafted: bool, model_family: str, no_ground_truth: bool = False, test_mode: bool = False):
     print(f"\n--- Starting Local All-at-Once Analysis ({model_family}) ---")
     json_files = _get_sorted_json_files(directory_path)
+    if test_mode:
+        json_files = json_files[:1]
     index_agent = "role" if is_handcrafted else "name"
 
     for json_file in tqdm(json_files, desc=f"All-at-Once ({model_family})"):
@@ -107,10 +116,12 @@ def analyze_all_at_once_local(model_obj, directory_path: str, is_handcrafted: bo
             f"{entry.get(index_agent, 'Unknown Agent')}: {entry.get('content', '')}" for entry in chat_history
         ])
 
+        gt_line = f"The Answer for the problem is: {ground_truth}\n" if not no_ground_truth else ""
+
         prompt = (
             "You are an AI assistant tasked with analyzing a multi-agent conversation history when solving a real world problem. "
             f"The problem is:  {problem} \n"
-            f"The Answer for the problem is: {ground_truth}\n"
+            f"{gt_line}"
             "Identify which agent made an error, at which step, and explain the reason for the error. "
             "Here's the conversation:\n\n" + chat_content +
             "\n\nBased on this conversation, please predict the following:\n"
@@ -122,7 +133,12 @@ def analyze_all_at_once_local(model_obj, directory_path: str, is_handcrafted: bo
             "Please answer in the format: Agent Name: (Your prediction)\n, Step Number: (Your prediction)\n, Reason for Mistake: (Your reason)\n."
         )
 
-    
+        if test_mode:
+            print(f"=== PROMPT FOR {json_file} ===")
+            print(prompt)
+            print(f"=== END PROMPT ===")
+            continue
+
         system_prompt = "You are a helpful assistant skilled in analyzing conversations."
 
         messages = [
@@ -139,9 +155,11 @@ def analyze_all_at_once_local(model_obj, directory_path: str, is_handcrafted: bo
             print("Failed to get prediction from local model.")
         print("\n" + "="*50 + "\n")
 
-def analyze_step_by_step_local(model_obj, directory_path: str, is_handcrafted: bool, model_family: str):
+def analyze_step_by_step_local(model_obj, directory_path: str, is_handcrafted: bool, model_family: str, no_ground_truth: bool = False, test_mode: bool = False):
     print(f"\n--- Starting Local Step-by-Step Analysis ({model_family}) ---")
     json_files = _get_sorted_json_files(directory_path)
+    if test_mode:
+        json_files = json_files[:1]
     index_agent = "role" if is_handcrafted else "name"
 
     for json_file in tqdm(json_files, desc=f"Step-by-Step ({model_family})"):
@@ -164,9 +182,11 @@ def analyze_step_by_step_local(model_obj, directory_path: str, is_handcrafted: b
             content = entry.get('content', '')
             current_conversation_history += f"Step {idx} - {agent_name}: {content}\n"
 
+            gt_line = f"The Answer for the problem is: {ground_truth}\n" if not no_ground_truth else ""
+
             prompt = (
                 f"You are an AI assistant tasked with evaluating the correctness of each step in an ongoing multi-agent conversation aimed at solving a real-world problem. The problem being addressed is: {problem}. "
-                f"The Answer for the problem is: {ground_truth}\n"
+                f"{gt_line}"
                 f"Here is the conversation history up to the current step:\n{current_conversation_history}\n"
                 f"The most recent step ({idx}) was by '{agent_name}'.\n"
                 "Your task is to determine whether this most recent agent's action (Step {idx}) contains an error that could hinder the problem-solving process or lead to an incorrect solution. "
@@ -174,6 +194,12 @@ def analyze_step_by_step_local(model_obj, directory_path: str, is_handcrafted: b
                 "Note: Please avoid being overly critical in your evaluation. Focus on errors that clearly derail the process."
                 "Attention: Respond ONLY in the format: 1. Yes/No.\n2. Reason: [Your explanation here]"
             )
+
+            if test_mode:
+                print(f"=== PROMPT FOR {json_file} (Step {idx}) ===")
+                print(prompt)
+                print(f"=== END PROMPT ===")
+                break
 
             system_prompt = "You are a helpful assistant skilled in analyzing conversations."
 
@@ -205,19 +231,24 @@ def analyze_step_by_step_local(model_obj, directory_path: str, is_handcrafted: b
             else:
                 print(f"Warning: Unexpected response format from local LLM for step {idx} in {json_file}. Response: {answer[:100]}...")
 
-        if not error_found:
-            print(f"\nNo decisive errors found by step-by-step analysis in file {json_file}")
+        if not error_found and not test_mode:
+            last_entry = chat_history[-1]
+            last_agent = last_entry.get(index_agent, 'Unknown Agent')
+            last_step = len(chat_history) - 1
+            print(f"\nPrediction for {json_file}:")
+            print(f"Agent Name: {last_agent}")
+            print(f"Step Number: {last_step}")
 
         print("\n" + "="*50 + "\n")
 
 
-def _construct_binary_search_prompt_local(problem, answer, chat_segment_content, range_description, upper_half_desc, lower_half_desc):
-     # Added answer back in based on previous logic, remove if not desired
+def _construct_binary_search_prompt_local(problem, answer, chat_segment_content, range_description, upper_half_desc, lower_half_desc, no_ground_truth=False):
+    gt_line = f"The Answer for the problem is: {answer}\n" if not no_ground_truth else ""
     return (
         "You are an AI assistant tasked with analyzing a segment of a multi-agent conversation. Multiple agents are collaborating to address a user query, with the goal of resolving the query through their collective dialogue.\n"
         "Your primary task is to identify the location of the most critical mistake within the provided segment. Determine which half of the segment contains the single step where this crucial error occurs, ultimately leading to the failure in resolving the user’s query.\n"
         f"The problem to address is as follows: {problem}\n"
-        f"The Answer for the problem is: {answer}\n"
+        f"{gt_line}"
         f"Review the following conversation segment {range_description}:\n\n{chat_segment_content}\n\n"
         f"Based on your analysis, predict whether the most critical error is more likely to be located in the upper half ({upper_half_desc}) or the lower half ({lower_half_desc}) of this segment.\n"
         "Please simply output either 'upper half' or 'lower half'. You should not output anything else."
@@ -228,12 +259,12 @@ def _report_binary_search_error_local(chat_history, step, json_file, is_handcraf
     entry = chat_history[step]
     agent_name = entry.get(index_agent, 'Unknown Agent')
 
-    print(f"\nPrediction for {json_file} (Binary Search Result):")
+    print(f"\nPrediction for {json_file}:")
     print(f"Agent Name: {agent_name}")
     print(f"Step Number: {step}")
     print("\n" + "="*50 + "\n")
 
-def _find_error_in_segment_local(model_obj, chat_history: list, problem: str, answer: str, start: int, end: int, json_file: str, is_handcrafted: bool, model_family: str):
+def _find_error_in_segment_local(model_obj, chat_history: list, problem: str, answer: str, start: int, end: int, json_file: str, is_handcrafted: bool, model_family: str, no_ground_truth: bool = False, test_mode: bool = False):
     if start > end:
          print(f"Warning: Invalid range in binary search for {json_file} (start={start}, end={end}). Reporting last valid step.")
          _report_binary_search_error_local(chat_history, end if end >= 0 else 0, json_file, is_handcrafted)
@@ -261,11 +292,15 @@ def _find_error_in_segment_local(model_obj, chat_history: list, problem: str, an
     upper_half_desc = f"from step {start} to step {mid}"
     lower_half_desc = f"from step {mid + 1} to step {end}"
 
-    prompt = _construct_binary_search_prompt_local(problem, answer, chat_content, range_description, upper_half_desc, lower_half_desc)
+    prompt = _construct_binary_search_prompt_local(problem, answer, chat_content, range_description, upper_half_desc, lower_half_desc, no_ground_truth=no_ground_truth)
 
-   
+    if test_mode:
+        print(f"=== PROMPT FOR {json_file} (segment {start}-{end}) ===")
+        print(prompt)
+        print(f"=== END PROMPT ===")
+        return
+
     system_prompt = "You are a helpful assistant skilled in analyzing conversations."
-
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -281,18 +316,20 @@ def _find_error_in_segment_local(model_obj, chat_history: list, problem: str, an
     result_lower = result.lower().strip()
 
     if "upper half" in result_lower:
-         _find_error_in_segment_local(model_obj, chat_history, problem, answer, start, mid, json_file, is_handcrafted, model_family)
+         _find_error_in_segment_local(model_obj, chat_history, problem, answer, start, mid, json_file, is_handcrafted, model_family, no_ground_truth=no_ground_truth)
     elif "lower half" in result_lower:
          new_start = min(mid + 1, end)
-         _find_error_in_segment_local(model_obj, chat_history, problem, answer, new_start, end, json_file, is_handcrafted, model_family)
+         _find_error_in_segment_local(model_obj, chat_history, problem, answer, new_start, end, json_file, is_handcrafted, model_family, no_ground_truth=no_ground_truth)
     else:
         print(f"Warning: Ambiguous response '{result}' from local LLM for segment {start}-{end}. Defaulting to upper half.")
-        _find_error_in_segment_local(model_obj, chat_history, problem, answer, start, mid, json_file, is_handcrafted, model_family)
+        _find_error_in_segment_local(model_obj, chat_history, problem, answer, start, mid, json_file, is_handcrafted, model_family, no_ground_truth=no_ground_truth)
 
 
-def analyze_binary_search_local(model_obj, directory_path: str, is_handcrafted: bool, model_family: str):
+def analyze_binary_search_local(model_obj, directory_path: str, is_handcrafted: bool, model_family: str, no_ground_truth: bool = False, test_mode: bool = False):
     print(f"\n--- Starting Local Binary Search Analysis ({model_family}) ---")
     json_files = _get_sorted_json_files(directory_path)
+    if test_mode:
+        json_files = json_files[:1]
 
     for json_file in tqdm(json_files, desc=f"Binary Search ({model_family})"):
         file_path = os.path.join(directory_path, json_file)
@@ -316,5 +353,7 @@ def analyze_binary_search_local(model_obj, directory_path: str, is_handcrafted: 
             end=len(chat_history) - 1,
             json_file=json_file,
             is_handcrafted=is_handcrafted,
-            model_family=model_family
+            model_family=model_family,
+            no_ground_truth=no_ground_truth,
+            test_mode=test_mode
         )

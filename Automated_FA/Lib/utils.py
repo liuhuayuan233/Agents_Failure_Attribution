@@ -1,7 +1,7 @@
 import os
 import json
 import random
-from openai import AzureOpenAI
+from openai import OpenAI
 from tqdm import tqdm
 # --- Helper Functions ---
 
@@ -30,7 +30,7 @@ def _load_json_data(file_path):
         return None
 
 def _make_api_call(client, model, messages, max_tokens):
-    """Makes an API call to Azure OpenAI."""
+    """Makes an API call to OpenAI-compatible endpoint."""
     try:
         response = client.chat.completions.create(
             model=model,
@@ -44,15 +44,19 @@ def _make_api_call(client, model, messages, max_tokens):
 
 # --- All-at-Once Method ---
 
-def all_at_once(client: AzureOpenAI, directory_path: str, is_handcrafted: bool, model: str, max_tokens: int):
+def all_at_once(client: OpenAI, directory_path: str, is_handcrafted: bool, model: str, max_tokens: int, no_ground_truth: bool = False, test_mode: bool = False, skip_files: set = None):
     """
     Analyzes chat history by feeding the entire conversation at once to the model.
     """
     print("\n--- Starting All-at-Once Analysis ---\n")
     json_files = _get_sorted_json_files(directory_path)
+    if test_mode:
+        json_files = json_files[:1]
     index_agent = "role" if is_handcrafted else "name"
 
     for json_file in tqdm(json_files):
+        if skip_files and json_file in skip_files:
+            continue
         file_path = os.path.join(directory_path, json_file)
         data = _load_json_data(file_path)
         if not data:
@@ -70,10 +74,12 @@ def all_at_once(client: AzureOpenAI, directory_path: str, is_handcrafted: bool, 
             f"{entry.get(index_agent, 'Unknown Agent')}: {entry.get('content', '')}" for entry in chat_history
         ])
 
+        gt_line = f"The Answer for the problem is: {ground_truth}\n" if not no_ground_truth else ""
+
         prompt = (
             "You are an AI assistant tasked with analyzing a multi-agent conversation history when solving a real world problem. "
             f"The problem is:  {problem}\n"
-            f"The Answer for the problem is: {ground_truth}\n" # Included as per original code - remove if ground truth shouldn't be used in prompt
+            f"{gt_line}"
             "Identify which agent made an error, at which step, and explain the reason for the error. "
             "Here's the conversation:\n\n" + chat_content +
             "\n\nBased on this conversation, please predict the following:\n"
@@ -92,6 +98,12 @@ def all_at_once(client: AzureOpenAI, directory_path: str, is_handcrafted: bool, 
             "Please answer in the format: Agent Name: (Your prediction)\n Step Number: (Your prediction)\n Reason for Mistake: \n"
         )
 
+        if test_mode:
+            print(f"=== PROMPT FOR {json_file} ===")
+            print(prompt)
+            print(f"=== END PROMPT ===")
+            continue
+
         messages=[
             {"role": "system", "content": "You are a helpful assistant skilled in analyzing conversations."},
             {"role": "user", "content": prompt},
@@ -108,15 +120,19 @@ def all_at_once(client: AzureOpenAI, directory_path: str, is_handcrafted: bool, 
 
 # --- Step-by-Step Method ---
 
-def step_by_step(client: AzureOpenAI, directory_path: str, is_handcrafted: bool, model: str, max_tokens: int):
+def step_by_step(client: OpenAI, directory_path: str, is_handcrafted: bool, model: str, max_tokens: int, no_ground_truth: bool = False, test_mode: bool = False, skip_files: set = None):
     """
     Analyzes chat history step by step, asking the model at each step if an error occurred.
     """
     print("\n--- Starting Step-by-Step Analysis ---\n")
     json_files = _get_sorted_json_files(directory_path)
+    if test_mode:
+        json_files = json_files[:1]
     index_agent = "role" if is_handcrafted else "name"
 
     for json_file in tqdm(json_files):
+        if skip_files and json_file in skip_files:
+            continue
         file_path = os.path.join(directory_path, json_file)
         data = _load_json_data(file_path)
         if not data:
@@ -124,7 +140,7 @@ def step_by_step(client: AzureOpenAI, directory_path: str, is_handcrafted: bool,
 
         chat_history = data.get("history", [])
         problem = data.get("question", "")
-        ground_truth = data.get("ground_truth", "") # Keep ground truth if needed
+        ground_truth = data.get("ground_truth", "")
 
         if not chat_history:
             print(f"Skipping {json_file}: No chat history found.")
@@ -138,9 +154,11 @@ def step_by_step(client: AzureOpenAI, directory_path: str, is_handcrafted: bool,
             content = entry.get('content', '')
             current_conversation_history += f"Step {idx} - {agent_name}: {content}\n"
 
+            gt_line = f"The Answer for the problem is: {ground_truth}\n" if not no_ground_truth else ""
+
             prompt = (
                 f"You are an AI assistant tasked with evaluating the correctness of each step in an ongoing multi-agent conversation aimed at solving a real-world problem. The problem being addressed is: {problem}. "
-                f"The Answer for the problem is: {ground_truth}\n" # Included as per original code - remove if ground truth shouldn't be used
+                f"{gt_line}"
                 f"Here is the conversation history up to the current step:\n{current_conversation_history}\n"
                 f"The most recent step ({idx}) was by '{agent_name}'.\n"
                 "Your task is to determine whether this most recent agent's action (Step {idx}) contains an error that could hinder the problem-solving process or lead to an incorrect solution. "
@@ -148,6 +166,12 @@ def step_by_step(client: AzureOpenAI, directory_path: str, is_handcrafted: bool,
                 "Note: Please avoid being overly critical in your evaluation. Focus on errors that clearly derail the process."
                 "Respond ONLY in the format: 1. Yes/No.\n2. Reason: [Your explanation here]"
             )
+
+            if test_mode:
+                print(f"=== PROMPT FOR {json_file} (Step {idx}) ===")
+                print(prompt)
+                print(f"=== END PROMPT ===")
+                break
 
             messages=[
                 {"role": "system", "content": "You are a precise step-by-step conversation evaluator."},
@@ -178,21 +202,27 @@ def step_by_step(client: AzureOpenAI, directory_path: str, is_handcrafted: bool,
                 print("Warning: Unexpected response format from LLM. Continuing evaluation.")
                 # Optionally handle unexpected format more robustly
 
-        if not error_found:
-            print(f"\nNo decisive errors found by step-by-step analysis in file {json_file}")
+        if not error_found and not test_mode:
+            last_entry = chat_history[-1]
+            last_agent = last_entry.get(index_agent, 'Unknown Agent')
+            last_step = len(chat_history) - 1
+            print(f"\nPrediction for {json_file}:")
+            print(f"Agent Name: {last_agent}")
+            print(f"Step Number: {last_step}")
 
         print("\n" + "="*50 + "\n")
 
 
 # --- Binary Search Method ---
 
-def _construct_binary_search_prompt(problem, answer, chat_segment_content, range_description, upper_half_desc, lower_half_desc):
+def _construct_binary_search_prompt(problem, answer, chat_segment_content, range_description, upper_half_desc, lower_half_desc, no_ground_truth=False):
     """Constructs the prompt for the binary search step."""
+    gt_line = f"The Answer for the problem is: {answer}\n" if not no_ground_truth else ""
     return (
         "You are an AI assistant tasked with analyzing a segment of a multi-agent conversation. Multiple agents are collaborating to address a user query, with the goal of resolving the query through their collective dialogue.\n"
         "Your primary task is to identify the location of the most critical mistake within the provided segment. Determine which half of the segment contains the single step where this crucial error occurs, ultimately leading to the failure in resolving the user’s query.\n"
         f"The problem to address is as follows: {problem}\n"
-        f"The Answer for the problem is: {answer}\n" # Included as per original code - remove if ground truth shouldn't be used
+        f"{gt_line}"
         f"Review the following conversation segment {range_description}:\n\n{chat_segment_content}\n\n"
         f"Based on your analysis, predict whether the most critical error is more likely to be located in the upper half ({upper_half_desc}) or the lower half ({lower_half_desc}) of this segment.\n"
         "Please provide your prediction by responding with ONLY 'upper half' or 'lower half'. Remember, your answer should be based on identifying the mistake that directly contributes to the failure in resolving the user's query. If no single clear error is evident, consider the step you believe is most responsible for the failure, allowing for subjective judgment, and base your answer on that."
@@ -209,7 +239,7 @@ def _report_binary_search_error(chat_history, step, json_file, is_handcrafted):
     print(f"Step Number: {step}")
     print("\n" + "="*50 + "\n")
 
-def _find_error_in_segment_recursive(client: AzureOpenAI, model: str, max_tokens: int, chat_history: list, problem: str, answer: str, start: int, end: int, json_file: str, is_handcrafted: bool):
+def _find_error_in_segment_recursive(client: OpenAI, model: str, max_tokens: int, chat_history: list, problem: str, answer: str, start: int, end: int, json_file: str, is_handcrafted: bool, no_ground_truth: bool = False, test_mode: bool = False):
     """Recursive helper function for binary search analysis."""
     if start > end:
          print(f"Warning: Invalid range in binary search for {json_file} (start={start}, end={end}). Reporting last valid step.")
@@ -238,7 +268,13 @@ def _find_error_in_segment_recursive(client: AzureOpenAI, model: str, max_tokens
     upper_half_desc = f"from step {start} to step {mid}"
     lower_half_desc = f"from step {mid + 1} to step {end}"
 
-    prompt = _construct_binary_search_prompt(problem, answer, chat_content, range_description, upper_half_desc, lower_half_desc)
+    prompt = _construct_binary_search_prompt(problem, answer, chat_content, range_description, upper_half_desc, lower_half_desc, no_ground_truth=no_ground_truth)
+
+    if test_mode:
+        print(f"=== PROMPT FOR {json_file} (segment {start}-{end}) ===")
+        print(prompt)
+        print(f"=== END PROMPT ===")
+        return
 
     messages = [
         {"role": "system", "content": "You are an AI assistant specializing in localizing errors in conversation segments."},
@@ -256,29 +292,33 @@ def _find_error_in_segment_recursive(client: AzureOpenAI, model: str, max_tokens
     result_lower = result.lower() 
 
     if "upper half" in result_lower:
-         _find_error_in_segment_recursive(client, model, max_tokens, chat_history, problem, answer, start, mid, json_file, is_handcrafted)
+         _find_error_in_segment_recursive(client, model, max_tokens, chat_history, problem, answer, start, mid, json_file, is_handcrafted, no_ground_truth=no_ground_truth)
     elif "lower half" in result_lower:
          new_start = min(mid + 1, end)
-         _find_error_in_segment_recursive(client, model, max_tokens, chat_history, problem, answer, new_start, end, json_file, is_handcrafted)
+         _find_error_in_segment_recursive(client, model, max_tokens, chat_history, problem, answer, new_start, end, json_file, is_handcrafted, no_ground_truth=no_ground_truth)
     else:
         print(f"Warning: Ambiguous response '{result}' from LLM for segment {start}-{end}. Randomly choosing a half.")
         if random.randint(0, 1) == 0:
             print("Randomly chose upper half.")
-            _find_error_in_segment_recursive(client, model, max_tokens, chat_history, problem, answer, start, mid, json_file, is_handcrafted)
+            _find_error_in_segment_recursive(client, model, max_tokens, chat_history, problem, answer, start, mid, json_file, is_handcrafted, no_ground_truth=no_ground_truth)
         else:
             print("Randomly chose lower half.")
             new_start = min(mid + 1, end)
-            _find_error_in_segment_recursive(client, model, max_tokens, chat_history, problem, answer, new_start, end, json_file, is_handcrafted)
+            _find_error_in_segment_recursive(client, model, max_tokens, chat_history, problem, answer, new_start, end, json_file, is_handcrafted, no_ground_truth=no_ground_truth)
 
 
-def binary_search(client: AzureOpenAI, directory_path: str, is_handcrafted: bool, model: str, max_tokens: int):
+def binary_search(client: OpenAI, directory_path: str, is_handcrafted: bool, model: str, max_tokens: int, no_ground_truth: bool = False, test_mode: bool = False, skip_files: set = None):
     """
     Analyzes chat history using a binary search approach to find the error step.
     """
     print("\n--- Starting Binary Search Analysis ---\n")
     json_files = _get_sorted_json_files(directory_path)
+    if test_mode:
+        json_files = json_files[:1]
 
     for json_file in tqdm(json_files):
+        if skip_files and json_file in skip_files:
+            continue
         file_path = os.path.join(directory_path, json_file)
         data = _load_json_data(file_path)
         if not data:
@@ -286,11 +326,11 @@ def binary_search(client: AzureOpenAI, directory_path: str, is_handcrafted: bool
 
         chat_history = data.get("history", [])
         problem = data.get("question", "")
-        answer = data.get("ground_truth", "") # Keep ground truth if needed
+        answer = data.get("ground_truth", "")
 
         if not chat_history:
             print(f"Skipping {json_file}: No chat history found.")
             continue
 
         print(f"--- Analyzing File: {json_file} ---")
-        _find_error_in_segment_recursive(client, model, max_tokens, chat_history, problem, answer, 0, len(chat_history) - 1, json_file, is_handcrafted)
+        _find_error_in_segment_recursive(client, model, max_tokens, chat_history, problem, answer, 0, len(chat_history) - 1, json_file, is_handcrafted, no_ground_truth=no_ground_truth, test_mode=test_mode)
