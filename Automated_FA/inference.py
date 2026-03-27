@@ -38,7 +38,7 @@ except ImportError:
     analyze_binary_search_local = None
 
 
-KNOWN_GPT_MODELS = {"gpt-4o", "gpt4", "gpt4o-mini", "gpt-5.4-nano"}
+KNOWN_GPT_MODELS = {"gpt-5.4-nano"}
 LOCAL_LLAMA_ALIASES = {"llama-8b", "llama-70b"}
 LOCAL_QWEN_ALIASES = {"qwen-7b", "qwen-72b"}
 LOCAL_MODEL_ALIASES = LOCAL_LLAMA_ALIASES | LOCAL_QWEN_ALIASES

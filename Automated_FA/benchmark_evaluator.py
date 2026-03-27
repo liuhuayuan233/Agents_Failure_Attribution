@@ -354,6 +354,7 @@ async def evaluate_all(
         loc_result = result.get("localization_result", {})
         pred = extract_prediction(loc_result)
 
+        usage = result.get("usage", {})
         entry = {
             "file": jf,
             "true_agent": sample["ground_truth"]["mistake_agent"],
@@ -363,8 +364,8 @@ async def evaluate_all(
             "confidence": pred["confidence"],
             "ranked_candidates": pred["ranked_candidates"],
             "llm_calls": 2 if not bypass_intent else 1,
-            "total_input_tokens": 0,
-            "total_output_tokens": 0,
+            "total_input_tokens": usage.get("prompt_tokens", 0),
+            "total_output_tokens": usage.get("completion_tokens", 0),
             "latency_ms": latency,
             "is_handcrafted": is_handcrafted,
             "history_length": sample["meta"]["history_length"],

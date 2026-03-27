@@ -1,0 +1,293 @@
+================================================================================
+                           项 目 路 线 图
+================================================================================
+
+总目标: 用你的 feedback 定位算法跑 Who&When benchmark，和原论文方法对比。
+关键发现: 原论文三种方法全部在 prompt 里传了正确答案(ground_truth)，属于开卷考试。
+
+
+================================================================================
+阶段零: 仓库组织
+================================================================================
+
+  T0  将 feedback 仓库挂为 submodule
+      ───────────────────────────────────────────────────────────────
+      操作: cd feedback && git checkout lhy && git checkout -b benchmark
+            cd Agents_Failure_Attribution && git submodule add ...
+      ───────────────────────────────────────────────────────────────
+      完成标志:
+        - 路径 Agents_Failure_Attribution/feedback/ 存在
+        - 终端执行 git submodule status 输出正常（无前缀减号）
+
+
+================================================================================
+阶段一: 数据适配层
+================================================================================
+
+  T1.1  Agent 名称提取函数
+        ─────────────────────────────────────────────────────────────
+        产出文件: Automated_FA/benchmark_adapter.py 中的 extract_agent_name()
+        ─────────────────────────────────────────────────────────────
+        完成标志:
+          - 对 Algorithm-Generated/23.json 提取出:
+            Art_Historian_Expert, Church_Historian_Expert,
+            DataVerification_Expert, Computer_terminal
+          - 对 Hand-Crafted/8.json 提取出:
+            Orchestrator, WebSurfer, FileSurfer
+            (不是 "Orchestrator (thought)" 这种带后缀的)
+          - 提取出的名字和该 JSON 的 mistake_agent 字段格式一致
+
+  T1.2  History → ExecutionTrace 转换
+        ─────────────────────────────────────────────────────────────
+        产出文件: benchmark_adapter.py 中的 convert_history_to_trace()
+        ─────────────────────────────────────────────────────────────
+        完成标志:
+          - 对 Algorithm-Generated/23.json (10 条消息) 生成 10 个 step
+          - step 编号 0-9，第 i 个 step 的 node_name 等于 history[i] 的 agent 名
+          - step 3 的 node_name 是 "Church_Historian_Expert"
+            (和 mistake_step="3" 对齐)
+
+  T1.3  WorkflowConfig 构造
+        ─────────────────────────────────────────────────────────────
+        产出文件: benchmark_adapter.py 中的 build_workflow_config()
+        ─────────────────────────────────────────────────────────────
+        完成标志:
+          - Algorithm-Generated/23.json 生成 4 个 node:
+            Art_Historian_Expert (AgentNode, 带 system_prompt)
+            Church_Historian_Expert (AgentNode, 带 system_prompt)
+            DataVerification_Expert (AgentNode, 带 system_prompt)
+            Computer_terminal (ExecutionNode)
+          - Hand-Crafted/8.json 生成 3 个 node:
+            Orchestrator (OrchestratorNode, 带角色描述)
+            WebSurfer (AgentNode, 带角色描述)
+            FileSurfer (AgentNode, 带角色描述)
+
+  T1.4  Feedback 文本构造
+        ─────────────────────────────────────────────────────────────
+        产出文件: benchmark_adapter.py 中的 build_feedback_text()
+        ─────────────────────────────────────────────────────────────
+        完成标志:
+          - level="generic" 输出包含 question 但不含 ground_truth 的文本
+          - level="task_aware" 输出同时包含 question 和 ground_truth 的文本
+
+  T1.5  总入口函数
+        ─────────────────────────────────────────────────────────────
+        产出文件: benchmark_adapter.py 中的 adapt_benchmark_sample()
+        ─────────────────────────────────────────────────────────────
+        完成标志:
+          终端运行 (--test 不调 LLM，纯数据转换):
+            python benchmark_adapter.py --test \
+              --json_path ../Who_and_When/Algorithm-Generated/23.json \
+              --is_handcrafted False
+          输出包含 workflow_config / execution_trace / feedback_text / ground_truth 四个 key
+          再跑一次 Hand-Crafted:
+            python benchmark_adapter.py --test \
+              --json_path ../Who_and_When/Hand-Crafted/8.json \
+              --is_handcrafted True
+
+  T2.1  FeedbackPipeline 增加 bypass_intent
+        ─────────────────────────────────────────────────────────────
+        改动文件: feedback/feedback/main_feedback.py
+        ─────────────────────────────────────────────────────────────
+        完成标志:
+          - process() 函数新增 bypass_intent 参数，默认 False
+          - bypass_intent=True 时不调用意图识别服务
+          - bypass_intent=False (默认) 时行为和改动前完全一致
+
+  T2.2  新增 process_from_dicts() 方法
+        ─────────────────────────────────────────────────────────────
+        改动文件: feedback/feedback/main_feedback.py
+        ─────────────────────────────────────────────────────────────
+        完成标志:
+          - 可以直接传 dict 而非文件路径
+          - 跳过升级阶段
+          - 返回包含 localization_result 的 dict
+
+  T2.3  定位服务支持 prompt_variant 参数
+        ─────────────────────────────────────────────────────────────
+        改动文件: feedback/feedback/service/workflow_localization.py
+        ─────────────────────────────────────────────────────────────
+        完成标志:
+          - localize() 新增 prompt_variant 参数
+          - prompt_variant="default" 加载原 workflow_localization.hprompt
+          - prompt_variant="benchmark" 加载新 prompt
+
+  T3    编写 benchmark 定位 prompt
+        ─────────────────────────────────────────────────────────────
+        产出文件: feedback/feedback/prompts/workflow_localization_benchmark.hprompt
+        ─────────────────────────────────────────────────────────────
+        要求: 以原 workflow_localization.hprompt 为基础改造
+        完成标志:
+          - 文件存在
+          - 用 --test 跑一条样本验证 prompt 输出格式 (会调 1 次 LLM):
+            python benchmark_evaluator.py --test \
+              --data_dir ../Who_and_When/Algorithm-Generated \
+              --is_handcrafted False \
+              --feedback_level task_aware \
+              --bypass_intent True \
+              --prompt_variant benchmark \
+              --output results/test_prompt.json
+          - 检查 test_prompt.json 的 per_sample[0].localization_result 包含:
+            assessment.confidence (数字)
+            localization.target_scope (agent 名列表)
+            localization.error_step (数字)
+            localization.ranked_candidates (列表，每项含 agent/step/confidence)
+
+  T3.5  修复原论文代码已知 Bug (ISSUES.md)
+        ─────────────────────────────────────────────────────────────
+        改动文件: Automated_FA/evaluate.py (1 处)
+                  Automated_FA/Lib/utils.py (1 处)
+                  Automated_FA/Lib/local_model.py (2 处)
+        ─────────────────────────────────────────────────────────────
+        修复内容:
+          Bug1: evaluate.py 中 "in" 改 "==" (防止 "3" in "13" 误匹配)
+          Bug2: Step-by-Step 未找到错误时补 Prediction for 兜底输出
+          Bug3: local_model.py Binary Search 输出去掉 "(Binary Search Result)"
+        完成标志:
+          用原论文方法跑一遍 evaluate.py，无 "Could not parse" 的 Warning
+
+  T3.6  原论文代码加 --no_ground_truth 开关
+        ─────────────────────────────────────────────────────────────
+        改动文件: Automated_FA/inference.py
+                  Automated_FA/Lib/utils.py (3 处)
+                  Automated_FA/Lib/local_model.py (3 处)
+        ─────────────────────────────────────────────────────────────
+        完成标志:
+          终端运行 (--test 只跑第一个 JSON，打印 prompt 不调 LLM):
+            python inference.py --method all_at_once --model gpt-4o \
+              --no_ground_truth --test --directory_path ...
+          确认输出的 prompt 中不包含 "The Answer for the problem is"
+          再跑一次不加 --no_ground_truth，确认 prompt 中包含该行
+
+
+================================================================================
+阶段二: 评测框架
+================================================================================
+
+  T4.1  评测主流程
+        ─────────────────────────────────────────────────────────────
+        产出文件: Automated_FA/benchmark_evaluator.py
+        ─────────────────────────────────────────────────────────────
+        完成标志:
+          先用 --test 跑一条样本验证端到端 (调 1 次 LLM):
+            python benchmark_evaluator.py --test \
+              --data_dir ../Who_and_When/Algorithm-Generated \
+              --is_handcrafted False \
+              --feedback_level task_aware \
+              --bypass_intent True \
+              --prompt_variant benchmark \
+              --output results/test_single.json
+          不报错，results/test_single.json 生成且格式完整
+          然后再跑完整数据集:
+            python benchmark_evaluator.py \
+              --data_dir ../Who_and_When/Algorithm-Generated \
+              ... (去掉 --test)
+              --output results/test_run.json
+          不报错，results/test_run.json 文件生成
+
+  T4.2  预测结果提取
+        完成标志: test_run.json 中每个样本的 per_sample 包含
+          predicted_agent / predicted_step / confidence / ranked_candidates
+
+  T4.3  指标计算
+        完成标志: test_run.json 的 metrics 字段包含以下全部 key:
+          agent_accuracy          (0~1 之间的数字)
+          step_accuracy           (0~1)
+          joint_accuracy          (0~1)
+          topk_agent_accuracy     (dict, 含 top1/top3)
+          topk_step_accuracy      (dict, 含 top1/top3)
+          mrr_agent               (0~1)
+          mrr_step                (0~1)
+          step_mae                (>=0 的数字)
+          step_window_accuracy    (dict, 含 w0/w1/w2)
+          ece                     (0~1)
+          calibration_bins        (列表)
+          efficiency              (dict, 含 avg_llm_calls/avg_input_tokens/avg_output_tokens)
+          stratified_metrics      (dict, 按 data_type/history_length/agent_count 分组)
+
+  T4.4  可视化
+        ─────────────────────────────────────────────────────────────
+        产出目录: results/figures/
+        ─────────────────────────────────────────────────────────────
+        完成标志: results/figures/ 下至少生成以下文件:
+          comparison_table.tex     (主对比表)
+          ablation_bar.png         (消融柱状图)
+          reliability_diagram.png  (置信度校准图)
+          stratified_bar.png       (分层对比图)
+          efficiency_bar.png       (效率对比图)
+
+  T4.5  命令行入口
+        完成标志:
+          以下三条命令均可正常执行:
+          python benchmark_evaluator.py --test --data_dir ... --output ...   (单样本快速验证)
+          python benchmark_evaluator.py --data_dir ... --output ...          (完整数据集)
+          python benchmark_evaluator.py --visualize --result_files a.json b.json ...
+
+
+================================================================================
+  里程碑 1: 基础对比 (可交付)
+================================================================================
+
+  跑完以下 8 组实验 x 2 数据集(AG+HC) = 16 次运行:
+
+  开卷组 (传 ground_truth):
+    B1  原论文 All-at-Once
+    B2  原论文 Step-by-Step
+    B3  原论文 Binary Search
+    E1  feedback (task_aware, bypass intent)
+
+  闭卷组 (不传 ground_truth):
+    B4  原论文 All-at-Once + --no_ground_truth
+    B5  原论文 Step-by-Step + --no_ground_truth
+    B6  原论文 Binary Search + --no_ground_truth
+    E0  feedback (generic, bypass intent)
+
+  产出:
+    results/ 下 16 份结果 JSON
+    results/figures/ 下 5 张图表
+    可以写报告了
+
+
+================================================================================
+阶段三: 消融实验 (可选)
+================================================================================
+
+  T5    跑 E2 实验
+        ─────────────────────────────────────────────────────────────
+        命令: python benchmark_evaluator.py \
+                --feedback_level task_aware --bypass_intent False ...
+        ─────────────────────────────────────────────────────────────
+        完成标志:
+          E2 结果 JSON 产出，对比:
+          E0 -> E1 的差值 = 知道正确答案的增益
+          E1 -> E2 的差值 = 意图识别阶段的增益
+
+
+================================================================================
+  里程碑 2: 消融实验
+================================================================================
+
+  产出: 在里程碑 1 基础上新增 E2 的 2 份结果 JSON，更新图表
+
+
+================================================================================
+附录: 指标清单
+================================================================================
+
+  基础:  Agent Acc / Step Acc / Joint Acc
+  排名:  Top-1 Agent Acc / Top-3 Agent Acc
+         Top-1 Step Acc / Top-3 Step Acc
+         MRR (Agent) / MRR (Step)
+  容错:  Step MAE / Step Acc@1 / Step Acc@2
+  校准:  ECE (仅 feedback 方法)
+  效率:  平均 LLM 调用次数 / 平均输入 Token / 平均输出 Token / 平均延迟
+
+================================================================================
+附录: 图表清单
+================================================================================
+
+  comparison_table.tex      8 种方法 x 全部指标的对比表
+  ablation_bar.png          E0->E1(->E2) 各指标变化 + B1 vs B4 等
+  reliability_diagram.png   feedback 方法的置信度 vs 实际准确率
+  stratified_bar.png        按数据类型/对话长度/Agent数 分组的指标对比
+  efficiency_bar.png        各方法的调用次数和 Token 消耗对比

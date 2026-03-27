@@ -1,5 +1,10 @@
 Who_and_When/
-*.md
-!/Users/liuhuayuan/homework/Agents_Failure_Attribution/TODO.md
-*.txt
+__pycache__/
+src/
+
 Automated_FA/results/
+Automated_FA/outputs/
+Automated_FA/test_experiments/runs/
+Automated_FA/test_experiments/sampled_data/
+Automated_FA/test_experiments/results/
+Automated_FA/test_experiments/logs/
