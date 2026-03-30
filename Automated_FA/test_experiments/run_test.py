@@ -56,12 +56,11 @@ HC_SOURCE = REPO_ROOT / "Who_and_When" / "Hand-Crafted"
 sys.path.insert(0, str(AUTOMATED_FA_DIR))
 sys.path.insert(0, str(FEEDBACK_CODE))
 
-ALL_EXPERIMENTS = ["E0", "E1", "E2", "B1", "B2", "B3", "B4", "B5", "B6"]
+ALL_EXPERIMENTS = ["E1", "E2", "B1", "B2", "B3", "B4", "B5", "B6"]
 
 EXPERIMENT_CONFIG = {
-    "E0": {"type": "feedback", "feedback_level": "generic",    "bypass_intent": True},
     "E1": {"type": "feedback", "feedback_level": "task_aware",  "bypass_intent": True},
-    "E2": {"type": "feedback", "feedback_level": "task_aware",  "bypass_intent": False},
+    "E2": {"type": "feedback", "feedback_level": "blind",       "bypass_intent": True},
     "B1": {"type": "baseline", "method": "all_at_once",  "no_gt": False},
     "B2": {"type": "baseline", "method": "step_by_step", "no_gt": False},
     "B3": {"type": "baseline", "method": "binary_search","no_gt": False},
@@ -169,6 +168,9 @@ async def run_feedback_experiment(exp_name, ag_dir, hc_dir, cfg, results_dir, lo
                 prompt_variant="benchmark",
                 log_dir=exp_log_dir,
                 log_prefix=log_prefix,
+                feedback_level=feedback_level,
+                workflow_graph_str=sample.get("workflow_graph_str"),
+                execution_trace_raw=sample.get("execution_trace_raw"),
             )
         except Exception as e:
             print(f" FAIL ({e})", flush=True)
@@ -191,7 +193,7 @@ async def run_feedback_experiment(exp_name, ag_dir, hc_dir, cfg, results_dir, lo
             "pred_step": pred["predicted_step"],
             "confidence": pred["confidence"],
             "ranked_candidates": pred["ranked_candidates"],
-            "llm_calls": 2 if not bypass_intent else 1,
+            "llm_calls": 1,
             "total_input_tokens": usage.get("prompt_tokens", 0),
             "total_output_tokens": usage.get("completion_tokens", 0),
             "latency_ms": latency,
@@ -432,15 +434,48 @@ def generate_summary(results_dir, experiments):
         )
 
     md = "\n".join(rows)
+
+    # 按 history_length 分桶的详细指标表
+    strat_lines = ["\n## 按对话长度分桶（20步一区间）\n"]
+    for exp in experiments:
+        path = os.path.join(results_dir, f"{exp}.json")
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        by_hl = data.get("stratified_metrics", {}).get("by_history_length", {})
+        if not by_hl:
+            continue
+        strat_lines.append(f"### {exp}\n")
+        strat_lines.append("| 区间 | N | Agent Acc | Step Acc | Joint Acc | Top-3 Agent | MRR Agent | Step MAE |")
+        strat_lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        for bucket, sm in sorted(by_hl.items(), key=lambda x: int(x[0].split("-")[0])):
+            mae_v = sm.get("step_mae")
+            mae_s = f"{mae_v:.2f}" if mae_v is not None else "-"
+            strat_lines.append(
+                f"| {bucket} | {sm.get('count',0)} "
+                f"| {sm.get('agent_accuracy',0):.2%} "
+                f"| {sm.get('step_accuracy',0):.2%} "
+                f"| {sm.get('joint_accuracy',0):.2%} "
+                f"| {sm.get('topk_agent_accuracy',{}).get('top3',0):.2%} "
+                f"| {sm.get('mrr_agent',0):.4f} "
+                f"| {mae_s} |"
+            )
+        strat_lines.append("")
+    strat_md = "\n".join(strat_lines)
+
     summary_path = os.path.join(results_dir, "summary.md")
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write(f"# 实验结果汇总\n\n生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         f.write(md + "\n")
+        f.write(strat_md + "\n")
 
     print("\n" + "=" * 100)
     print("实验结果汇总")
     print("=" * 100)
     print(md)
+    if strat_md.strip():
+        print(strat_md)
     print(f"\n详细结果: {results_dir}/")
     print(f"hprompt 日志: {os.path.join(os.path.dirname(results_dir), 'logs')}/")
     print("=" * 100)
@@ -491,7 +526,7 @@ def generate_figures(results_dir, experiments):
         return d if d is not None else default
 
     colors_map = {
-        "E0": "#2196F3", "E1": "#1565C0", "E2": "#0D47A1",
+        "E1": "#1565C0", "E2": "#2196F3",
         "B1": "#4CAF50", "B2": "#FF9800", "B3": "#F44336",
         "B4": "#81C784", "B5": "#FFB74D", "B6": "#E57373",
     }
@@ -546,7 +581,7 @@ def generate_figures(results_dir, experiments):
     plt.close(fig)
 
     # ── 图3: 开卷 vs 闭卷对比 ──
-    pairs = [("E0", "E1"), ("B4", "B1"), ("B5", "B2"), ("B6", "B3")]
+    pairs = [("E2", "E1"), ("B4", "B1"), ("B5", "B2"), ("B6", "B3")]
     pairs = [(c, o) for c, o in pairs if c in all_data and o in all_data]
     if pairs:
         fig, axes = plt.subplots(1, 3, figsize=(14, 4))
@@ -686,8 +721,8 @@ async def main():
     parser = argparse.ArgumentParser(description="一键运行 9 组实验（采样数据）")
     parser.add_argument("--experiments", nargs="+", default=ALL_EXPERIMENTS, choices=ALL_EXPERIMENTS,
                         help="要运行的实验列表 (默认全部)")
-    parser.add_argument("--n_ag", type=int, default=1, help="从 AG 采样的数量")
-    parser.add_argument("--n_hc", type=int, default=1, help="从 HC 采样的数量")
+    parser.add_argument("--n_ag", type=int, default=10, help="从 AG 采样的数量")
+    parser.add_argument("--n_hc", type=int, default=10, help="从 HC 采样的数量")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--resample", action="store_true", help="强制重新采样")
     parser.add_argument("--model", type=str, default="gpt-5.4-nano", help="模型名称")
@@ -708,6 +743,7 @@ async def main():
 
     print("=" * 60)
     print(f"  测试实验 ({len(args.experiments)} 组)")
+    print(f"  实验列表: {', '.join(args.experiments)}")
     print(f"  Run ID : {run_id}")
     print(f"  模型: {args.model}  种子: {args.seed}")
     print(f"  采样: AG={args.n_ag}, HC={args.n_hc}")

@@ -8,3 +8,5 @@ Automated_FA/test_experiments/runs/
 Automated_FA/test_experiments/sampled_data/
 Automated_FA/test_experiments/results/
 Automated_FA/test_experiments/logs/
+
+*.txt

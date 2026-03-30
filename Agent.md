@@ -1,4 +1,4 @@
-1. 项目TODO list: Agents_Failure_Attribution/TODO.md   每完成一项任务需要更改这个md，标记为任务已完成。确定完成前需要自动运行代码，校验结果是否符合预期
+1. 项目TODO list: Agents_Failure_Attribution/TODO.md 以及 Agents_Failure_Attribution/TODO_v2.md 每完成一项任务需要更改这个md，标记为任务已完成。确定完成前需要自动运行代码，校验结果是否符合预期
 2. 验收标准： Agents_Failure_Attribution/ROADMAP.txt    完成任务时不需要更改该md， 该文件是作为校验结果的参考
 3. benchmark库目前存在的问题： Agents_Failure_Attribution/ISSUES.md  会在TODO list中得到解决。需重点关注成果是否符合预期
 4. 两仓库融合存在的问题： Agents_Failure_Attribution/ADAPTATION_ISSUES.md   会在TODO list中得到解决，是本项目重点，在确保完成前一定要自动运行代码，查看结果是否符合预期

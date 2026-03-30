@@ -182,10 +182,16 @@ def stratified_metrics(preds: List[dict]) -> dict:
     def _compute(subset):
         if not subset:
             return {}
+        cal = confidence_calibration(subset)
+        mae = step_mae(subset)
         return {
             "agent_accuracy": agent_accuracy(subset),
             "step_accuracy": step_accuracy(subset),
             "joint_accuracy": joint_accuracy(subset),
+            "topk_agent_accuracy": {"top1": topk_agent_accuracy(subset, 1), "top3": topk_agent_accuracy(subset, 3)},
+            "mrr_agent": mrr_agent(subset),
+            "step_mae": mae,
+            "ece": cal["ece"],
             "count": len(subset),
         }
 
@@ -198,19 +204,14 @@ def stratified_metrics(preds: List[dict]) -> dict:
     for k, v in by_type.items():
         result["by_data_type"][k] = _compute(v)
 
-    for p in preds:
-        hl = p.get("history_length", 0)
-        if hl <= 5:
-            bucket = "short(1-5)"
-        elif hl <= 8:
-            bucket = "medium(6-8)"
-        else:
-            bucket = "long(9+)"
-        p["_hl_bucket"] = bucket
     by_hl = defaultdict(list)
     for p in preds:
-        by_hl[p["_hl_bucket"]].append(p)
-    for k, v in by_hl.items():
+        hl = p.get("history_length", 0)
+        lo = (hl // 20) * 20
+        hi = lo + 19
+        bucket = f"{lo}-{hi}"
+        by_hl[bucket].append(p)
+    for k, v in sorted(by_hl.items(), key=lambda x: int(x[0].split("-")[0])):
         result["by_history_length"][k] = _compute(v)
 
     by_ac = defaultdict(list)
@@ -335,6 +336,9 @@ async def evaluate_all(
                 execution_trace=sample["execution_trace"],
                 bypass_intent=bypass_intent,
                 prompt_variant=prompt_variant,
+                feedback_level=feedback_level,
+                workflow_graph_str=sample.get("workflow_graph_str"),
+                execution_trace_raw=sample.get("execution_trace_raw"),
             )
         except Exception as e:
             print(f"  [FAIL] Pipeline error: {e}")
@@ -363,7 +367,7 @@ async def evaluate_all(
             "pred_step": pred["predicted_step"],
             "confidence": pred["confidence"],
             "ranked_candidates": pred["ranked_candidates"],
-            "llm_calls": 2 if not bypass_intent else 1,
+            "llm_calls": 1,
             "total_input_tokens": usage.get("prompt_tokens", 0),
             "total_output_tokens": usage.get("completion_tokens", 0),
             "latency_ms": latency,
@@ -862,7 +866,7 @@ def main():
     parser.add_argument("--test", action="store_true", help="Test mode: only process the first sample")
     parser.add_argument("--data_dir", type=str, help="Path to benchmark JSON directory")
     parser.add_argument("--is_handcrafted", type=str, default="False", choices=["True", "False"])
-    parser.add_argument("--feedback_level", type=str, default="task_aware", choices=["generic", "task_aware"])
+    parser.add_argument("--feedback_level", type=str, default="task_aware", choices=["blind", "generic", "task_aware"])
     parser.add_argument("--bypass_intent", type=str, default="True", choices=["True", "False"])
     parser.add_argument("--prompt_variant", type=str, default="benchmark", choices=["default", "benchmark"])
     parser.add_argument("--output", type=str, default="results/output.json", help="Output JSON path")

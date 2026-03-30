@@ -10,7 +10,9 @@ import json
 import os
 import sys
 import argparse
+import yaml
 from datetime import datetime
+from collections import defaultdict
 
 
 MAGENTIC_ONE_DESCRIPTIONS = {
@@ -65,16 +67,13 @@ def convert_history_to_trace(data: dict, is_handcrafted: bool) -> dict:
 
     for i, msg in enumerate(history):
         agent_name = extract_agent_name(msg, is_handcrafted)
-        prev_content = history[i - 1].get("content", "") if i > 0 else ""
-
         step_entry = {
             "step": i,
             "node_name": agent_name,
             "node_type": _get_node_type(agent_name),
             "status": "completed",
-            "inputs": {"context": prev_content} if prev_content else {},
+            "inputs": {},
             "outputs": {"response": msg.get("content", "")},
-            "args_used": None,
         }
         execution.append(step_entry)
 
@@ -90,6 +89,21 @@ def convert_history_to_trace(data: dict, is_handcrafted: bool) -> dict:
         "execution": execution,
     }
     return trace
+
+
+def _build_trace_for_display(trace: dict) -> dict:
+    """构建精简版 trace 用于 prompt 展示（去掉顶层元数据和冗余字段）。"""
+    return {
+        "execution": [
+            {
+                "step": step["step"],
+                "node_name": step["node_name"],
+                "node_type": step["node_type"],
+                "output": step["outputs"].get("response", ""),
+            }
+            for step in trace["execution"]
+        ]
+    }
 
 
 def build_workflow_config(data: dict, is_handcrafted: bool) -> dict:
@@ -153,16 +167,149 @@ def build_workflow_config(data: dict, is_handcrafted: bool) -> dict:
     return config
 
 
+def _compress_step_list(steps: list) -> str:
+    """将步骤列表压缩为范围字符串：[1,2,3,5,6,9] → '1-3, 5-6, 9'"""
+    if not steps:
+        return ""
+    ranges = []
+    start = steps[0]
+    end = steps[0]
+    for s in steps[1:]:
+        if s == end + 1:
+            end = s
+        else:
+            ranges.append(f"{start}-{end}" if end > start else str(start))
+            start = end = s
+    ranges.append(f"{start}-{end}" if end > start else str(start))
+    return ", ".join(ranges)
+
+
+def _content_preview(content: str, max_len: int = 1000) -> str:
+    if not content:
+        return ""
+    return content[:max_len] + ("..." if len(content) > max_len else "")
+
+
+def build_workflow_graph(data: dict, is_handcrafted: bool) -> str:
+    """
+    从对话历史中推导工作流架构，以类似 workflow.yaml 的格式表示。
+    step 保持 0-indexed，与 trace 和 benchmark ground truth 一致。
+    outputs 包含具体的传输内容摘要。
+    agents_count 仅统计真正的 Agent（排除 ExecutionNode 和 HumanInputNode）。
+    """
+    history = data.get("history", [])
+    MAX_EXAMPLES = 3
+
+    seen_agents = set()
+    agent_order = []
+    agent_steps = defaultdict(list)
+
+    for i, msg in enumerate(history):
+        name = extract_agent_name(msg, is_handcrafted)
+        if name == "human":
+            continue
+        agent_steps[name].append(i)
+        if name not in seen_agents:
+            seen_agents.add(name)
+            agent_order.append(name)
+
+    transition_map = defaultdict(list)
+    chain = []
+    for i, msg in enumerate(history):
+        name = extract_agent_name(msg, is_handcrafted)
+        if name == "human":
+            continue
+        chain.append(name)
+        if i > 0:
+            prev = extract_agent_name(history[i - 1], is_handcrafted)
+            if prev != "human":
+                transition_map[(prev, name)].append((i - 1, i))
+
+    
+
+    nodes = []
+    for agent in agent_order:
+        node = {
+            "name": agent,
+            "type": _get_node_type(agent),
+            "appearances": len(agent_steps[agent]),
+            "active_steps": _compress_step_list(agent_steps[agent]),
+        }
+        outputs = {}
+        for (from_a, to_a), pairs in transition_map.items():
+            if from_a == agent:
+                key = to_a if to_a != agent else f"{to_a}(self)"
+                examples = []
+                for fs, ts in pairs[:MAX_EXAMPLES]:
+                    preview = _content_preview(history[fs].get("content", ""))
+                    examples.append(f"step {fs}→{ts}: {preview}")
+                if len(pairs) > MAX_EXAMPLES:
+                    examples.append(f"... 共{len(pairs)}次转换")
+                outputs[key] = examples
+        if outputs:
+            node["outputs"] = outputs
+        nodes.append(node)
+
+    if len(chain) > 20:
+        compressed = _compress_execution_chain(chain)
+    else:
+        compressed = " → ".join(chain)
+
+    graph = {
+        "total_steps": len(history),
+        "nodes_count": len(agent_order),
+        "nodes": nodes,
+        "execution_chain": compressed,
+    }
+    return yaml.dump(graph, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+
+def _compress_execution_chain(chain: list) -> str:
+    """压缩长执行链，折叠重复的循环模式。"""
+    if len(chain) <= 20:
+        return " → ".join(chain)
+
+    # 检测循环模式：找到最短重复单元
+    for period in range(2, min(len(chain) // 2 + 1, 8)):
+        pattern = chain[:period]
+        count = 0
+        i = 0
+        while i + period <= len(chain):
+            if chain[i:i + period] == pattern:
+                count += 1
+                i += period
+            else:
+                break
+        if count >= 3:
+            remainder = chain[i:]
+            pat_str = " → ".join(pattern)
+            result = f"[{pat_str}] ×{count}"
+            if remainder:
+                if len(remainder) > 10:
+                    result += f" → ... → {' → '.join(remainder[-5:])}"
+                else:
+                    result += f" → {' → '.join(remainder)}"
+            return result
+
+    # 无明显循环，截断显示
+    head = " → ".join(chain[:10])
+    tail = " → ".join(chain[-5:])
+    return f"{head} → ... ({len(chain)} steps total) ... → {tail}"
+
+
 def build_feedback_text(data: dict, level: str) -> str:
     """
     根据不同实验条件构造 feedback_text。
-    - "generic": 不含 ground_truth（闭卷模式）
-    - "task_aware": 含 ground_truth（开卷模式，与原论文等量信息）
+    - "blind": 不含任何额外信息（纯轨迹分析）
+    - "generic": 含任务描述，不含 ground_truth
+    - "task_aware": 含任务描述 + ground_truth（开卷模式，与原论文等量信息）
     """
     question = data.get("question", "")
     ground_truth = data.get("ground_truth", "")
 
-    if level == "generic":
+    if level == "blind":
+        return ""
+    elif level == "generic":
         return (
             f"任务描述：{question}\n\n"
             f"该多 Agent 系统未能正确完成此任务。"
@@ -176,7 +323,7 @@ def build_feedback_text(data: dict, level: str) -> str:
             f"请分析对话轨迹，找出是哪个 Agent 在哪个步骤犯了导致任务失败的关键错误。"
         )
     else:
-        raise ValueError(f"Unknown feedback level: {level}. Must be 'generic' or 'task_aware'.")
+        raise ValueError(f"Unknown feedback level: {level}. Must be 'blind', 'generic', or 'task_aware'.")
 
 
 def adapt_benchmark_sample(json_path: str, is_handcrafted: bool, feedback_level: str = "generic") -> dict:
@@ -189,6 +336,7 @@ def adapt_benchmark_sample(json_path: str, is_handcrafted: bool, feedback_level:
     workflow_config = build_workflow_config(data, is_handcrafted)
     execution_trace = convert_history_to_trace(data, is_handcrafted)
     feedback_text = build_feedback_text(data, feedback_level)
+    workflow_graph_str = build_workflow_graph(data, is_handcrafted)
     task_ground_truth = data.get("ground_truth", "")
 
     history = data.get("history", [])
@@ -198,10 +346,13 @@ def adapt_benchmark_sample(json_path: str, is_handcrafted: bool, feedback_level:
         if name != "human":
             unique_agents.add(name)
 
+    trace_display = _build_trace_for_display(execution_trace)
+
     return {
         "workflow_config": workflow_config,
+        "workflow_graph_str": workflow_graph_str,
         "execution_trace": execution_trace,
-        "execution_trace_raw": execution_trace,
+        "execution_trace_raw": trace_display,
         "feedback_text": feedback_text,
         "question": data.get("question", ""),
         "task_ground_truth": task_ground_truth,
@@ -226,7 +377,7 @@ def main():
     parser.add_argument("--test", action="store_true", help="Test mode: process one sample and print summary")
     parser.add_argument("--json_path", type=str, required=True, help="Path to benchmark JSON file")
     parser.add_argument("--is_handcrafted", type=str, default="False", choices=["True", "False"])
-    parser.add_argument("--feedback_level", type=str, default="generic", choices=["generic", "task_aware"])
+    parser.add_argument("--feedback_level", type=str, default="generic", choices=["blind", "generic", "task_aware"])
 
     args = parser.parse_args()
     is_handcrafted = args.is_handcrafted == "True"
