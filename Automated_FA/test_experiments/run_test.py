@@ -1,34 +1,33 @@
 #!/usr/bin/env python3
 """
-测试实验脚本 — 一键运行全部 9 组实验（采样数据）
+实验脚本 — 一键运行全部 8 组实验（支持采样/全量/断点续传）
 
 使用方式:
-    python run_test.py                        # 运行全部 9 组
-    python run_test.py --experiments E0 E1    # 只运行指定实验
-    python run_test.py --seed 123             # 自定义随机种子
-    python run_test.py --n_ag 3 --n_hc 3     # 自定义采样数量
-    python run_test.py --resample             # 强制重新采样数据
-    python run_test.py --run_id my_test       # 指定 run ID（默认自动时间戳）
+    python run_test.py                           # 采样模式，默认 AG=10 HC=10
+    python run_test.py --n_ag -1 --n_hc -1       # 全量模式（AG=126, HC=58）
+    python run_test.py --experiments E1 E2       # 只运行指定实验
+    python run_test.py --n_ag 3 --n_hc 3         # 自定义采样数量
+    python run_test.py --run_id my_test          # 指定 run ID
+    python run_test.py --run_id my_test          # 中断后重跑同 run_id，自动断点续传
+    python run_test.py --force --run_id my_test  # 强制重跑，忽略已有结果
 
-每次运行自动创建独立目录，互不覆盖:
-    test_experiments/
-    ├── run_test.py
-    ├── sampled_data/              # 采样数据（跨 run 共享，同 seed 同数据）
-    │   ├── AG/
-    │   └── HC/
-    └── runs/
-        ├── run_0327_1252/         # 第一次运行
-        │   ├── results/
-        │   │   ├── E0.json ... B6.json
-        │   │   ├── summary.md
-        │   │   └── figures/       # 自动生成的 6 张图表
-        │   └── logs/
-        │       ├── E0/            # hprompt input/output
-        │       ├── E2/            # 含 intent + localize 日志
-        │       └── B1/            # baseline 推理输出 txt
-        └── run_0327_1430/         # 第二次运行（完全独立）
-            ├── results/
-            └── logs/
+断点续传机制:
+    - 实验级: 已有完整结果 JSON 的实验自动跳过
+    - 样本级: feedback 实验中断后，通过 .progress.jsonl 恢复已完成的样本
+    - baseline 实验中断后，用 skip_files 跳过已完成的样本
+    - 使用 --force 可忽略所有已有结果，强制重跑
+
+每次运行自动创建独立目录:
+    test_experiments/runs/
+    └── run_0327_1252/
+        ├── sampled_data/AG/ HC/       # 采样模式下的数据副本
+        ├── results/
+        │   ├── E1.json ... B6.json    # 含 metrics + stratified_metrics + per_sample
+        │   ├── summary.md
+        │   └── figures/               # 7 张图表
+        └── logs/
+            ├── E1/                    # hprompt input/output
+            └── B1/                    # baseline 推理输出 txt
 """
 
 import os
@@ -71,18 +70,31 @@ EXPERIMENT_CONFIG = {
 
 
 def sample_data(n_ag=5, n_hc=5, seed=42, force=False, run_dir=None):
+    # n_ag=-1 或 n_hc=-1 表示全量数据，直接使用原始目录
+    if n_ag < 0 and n_hc < 0:
+        ag_count = len(sorted(AG_SOURCE.glob("*.json")))
+        hc_count = len(sorted(HC_SOURCE.glob("*.json")))
+        print(f"  全量模式: AG={ag_count}条, HC={hc_count}条 (直接使用原始目录)")
+        return str(AG_SOURCE), str(HC_SOURCE)
+
     base = Path(run_dir) if run_dir else SCRIPT_DIR / "sampled_data"
     ag_out = base / "sampled_data" / "AG" if run_dir else SCRIPT_DIR / "sampled_data" / "AG"
     hc_out = base / "sampled_data" / "HC" if run_dir else SCRIPT_DIR / "sampled_data" / "HC"
 
+    # 如果某维度为 -1，该维度使用原始目录
+    if n_ag < 0:
+        ag_out = AG_SOURCE
+    if n_hc < 0:
+        hc_out = HC_SOURCE
+
     need_resample = force
     if not need_resample:
-        if not ag_out.exists() or not hc_out.exists():
+        if (n_ag >= 0 and not ag_out.exists()) or (n_hc >= 0 and not hc_out.exists()):
             need_resample = True
         else:
             existing_ag = sorted(ag_out.glob("*.json"))
             existing_hc = sorted(hc_out.glob("*.json"))
-            if len(existing_ag) != n_ag or len(existing_hc) != n_hc:
+            if (n_ag >= 0 and len(existing_ag) != n_ag) or (n_hc >= 0 and len(existing_hc) != n_hc):
                 print(f"  采样数量不匹配 (现有 AG={len(existing_ag)}/HC={len(existing_hc)}, 需要 AG={n_ag}/HC={n_hc})，重新采样")
                 need_resample = True
 
@@ -97,23 +109,25 @@ def sample_data(n_ag=5, n_hc=5, seed=42, force=False, run_dir=None):
     random.seed(seed)
     ag_files = sorted(AG_SOURCE.glob("*.json"))
     hc_files = sorted(HC_SOURCE.glob("*.json"))
-    selected_ag = random.sample(ag_files, min(n_ag, len(ag_files)))
-    selected_hc = random.sample(hc_files, min(n_hc, len(hc_files)))
 
-    if ag_out.exists():
-        shutil.rmtree(ag_out)
-    if hc_out.exists():
-        shutil.rmtree(hc_out)
-    ag_out.mkdir(parents=True)
-    hc_out.mkdir(parents=True)
+    if n_ag >= 0:
+        selected_ag = random.sample(ag_files, min(n_ag, len(ag_files)))
+        if ag_out.exists() and ag_out != AG_SOURCE:
+            shutil.rmtree(ag_out)
+        ag_out.mkdir(parents=True, exist_ok=True)
+        for f in selected_ag:
+            shutil.copy2(f, ag_out / f.name)
+        print(f"  AG ({n_ag}条): {[f.name for f in selected_ag]}")
 
-    for f in selected_ag:
-        shutil.copy2(f, ag_out / f.name)
-    for f in selected_hc:
-        shutil.copy2(f, hc_out / f.name)
+    if n_hc >= 0:
+        selected_hc = random.sample(hc_files, min(n_hc, len(hc_files)))
+        if hc_out.exists() and hc_out != HC_SOURCE:
+            shutil.rmtree(hc_out)
+        hc_out.mkdir(parents=True, exist_ok=True)
+        for f in selected_hc:
+            shutil.copy2(f, hc_out / f.name)
+        print(f"  HC ({n_hc}条): {[f.name for f in selected_hc]}")
 
-    print(f"  AG ({n_ag}条): {[f.name for f in selected_ag]}")
-    print(f"  HC ({n_hc}条): {[f.name for f in selected_hc]}")
     return str(ag_out), str(hc_out)
 
 
@@ -121,10 +135,44 @@ def sample_data(n_ag=5, n_hc=5, seed=42, force=False, run_dir=None):
 # Feedback 实验 (E0/E1/E2)
 # ============================================================
 
+def _progress_path(results_dir, exp_name):
+    return os.path.join(results_dir, f".{exp_name}.progress.jsonl")
+
+
+def _load_progress(results_dir, exp_name):
+    """从 .progress.jsonl 加载已完成样本，返回 (predictions, done_keys)"""
+    ppath = _progress_path(results_dir, exp_name)
+    predictions, done_keys = [], set()
+    if not os.path.exists(ppath):
+        return predictions, done_keys
+    with open(ppath, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            key = f"{entry.get('dataset','')}/{entry['file']}"
+            if entry.get("_status") == "failed":
+                done_keys.add(key)
+            else:
+                predictions.append(entry)
+                done_keys.add(key)
+    return predictions, done_keys
+
+
+def _append_progress(results_dir, exp_name, entry):
+    ppath = _progress_path(results_dir, exp_name)
+    with open(ppath, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+
+
 async def run_feedback_experiment(exp_name, ag_dir, hc_dir, cfg, results_dir, logs_dir):
     from benchmark_adapter import adapt_benchmark_sample
     from main_feedback import FeedbackPipeline
-    from benchmark_evaluator import extract_prediction, compute_all_metrics
+    from benchmark_evaluator import extract_prediction, compute_all_metrics, stratified_metrics
 
     pipeline = FeedbackPipeline()
     exp_log_dir = os.path.join(logs_dir, exp_name)
@@ -132,7 +180,11 @@ async def run_feedback_experiment(exp_name, ag_dir, hc_dir, cfg, results_dir, lo
 
     feedback_level = cfg["feedback_level"]
     bypass_intent = cfg["bypass_intent"]
-    predictions = []
+
+    # 断点续传：加载已完成的样本
+    predictions, done_keys = _load_progress(results_dir, exp_name)
+    if done_keys:
+        print(f"    [断点续传] 已完成 {len(done_keys)} 条，从断点继续", flush=True)
 
     all_samples = []
     for is_hc, data_dir, ds_label in [(False, ag_dir, "AG"), (True, hc_dir, "HC")]:
@@ -145,15 +197,21 @@ async def run_feedback_experiment(exp_name, ag_dir, hc_dir, cfg, results_dir, lo
 
     total = len(all_samples)
     for idx, (is_hc, data_dir, ds_label, jf) in enumerate(all_samples, 1):
+        sample_key = f"{ds_label}/{jf}"
+        if sample_key in done_keys:
+            print(f"    [{idx}/{total}] {sample_key} ... SKIP (已完成)", flush=True)
+            continue
+
         json_path = os.path.join(data_dir, jf)
         sample_id = jf.replace(".json", "")
         log_prefix = f"{ds_label}_{sample_id}_"
-        print(f"    [{idx}/{total}] {ds_label}/{jf} ...", end="", flush=True)
+        print(f"    [{idx}/{total}] {sample_key} ...", end="", flush=True)
 
         try:
             sample = adapt_benchmark_sample(json_path, is_hc, feedback_level)
         except Exception as e:
             print(f" SKIP (adapter: {e})", flush=True)
+            _append_progress(results_dir, exp_name, {"file": jf, "dataset": ds_label, "_status": "failed", "error": str(e)})
             continue
 
         t0 = time.time()
@@ -174,11 +232,13 @@ async def run_feedback_experiment(exp_name, ag_dir, hc_dir, cfg, results_dir, lo
             )
         except Exception as e:
             print(f" FAIL ({e})", flush=True)
+            _append_progress(results_dir, exp_name, {"file": jf, "dataset": ds_label, "_status": "failed", "error": str(e)})
             continue
         latency = (time.time() - t0) * 1000
 
         if not result.get("success"):
             print(f" FAIL ({result.get('error')})", flush=True)
+            _append_progress(results_dir, exp_name, {"file": jf, "dataset": ds_label, "_status": "failed", "error": result.get("error")})
             continue
 
         loc_result = result.get("localization_result", {})
@@ -202,6 +262,7 @@ async def run_feedback_experiment(exp_name, ag_dir, hc_dir, cfg, results_dir, lo
             "agent_count": sample["meta"]["agent_count"],
         }
         predictions.append(entry)
+        _append_progress(results_dir, exp_name, entry)
 
         a_ok = "✓" if entry["pred_agent"] == entry["true_agent"] else "✗"
         s_ok = "✓" if str(entry["pred_step"]) == str(entry["true_step"]) else "✗"
@@ -209,15 +270,22 @@ async def run_feedback_experiment(exp_name, ag_dir, hc_dir, cfg, results_dir, lo
         print(f" Agent:{a_ok} Step:{s_ok} ({latency:.0f}ms, {tok})", flush=True)
 
     metrics = compute_all_metrics(predictions)
+    strat = stratified_metrics(predictions)
     output = {
         "experiment": exp_name,
         "config": cfg,
         "metrics": metrics,
+        "stratified_metrics": strat,
         "per_sample": predictions,
     }
     out_path = os.path.join(results_dir, f"{exp_name}.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False, default=str)
+
+    # 全部完成后清理 progress 文件
+    ppath = _progress_path(results_dir, exp_name)
+    if os.path.exists(ppath):
+        os.remove(ppath)
 
     return metrics
 
@@ -283,9 +351,7 @@ def run_baseline_experiment(exp_name, ag_dir, hc_dir, cfg, results_dir, logs_dir
         step_by_step as gpt_step_by_step,
         binary_search as gpt_binary_search,
     )
-    from benchmark_evaluator import _parse_baseline_predictions, compute_all_metrics
-
-    import math
+    from benchmark_evaluator import _parse_baseline_predictions, compute_all_metrics, stratified_metrics
 
     method = cfg["method"]
     no_gt = cfg["no_gt"]
@@ -296,14 +362,38 @@ def run_baseline_experiment(exp_name, ag_dir, hc_dir, cfg, results_dir, logs_dir
     exp_log_dir = os.path.join(logs_dir, exp_name)
     os.makedirs(exp_log_dir, exist_ok=True)
 
-    all_predictions = []
+    # 断点续传：加载已有的 progress
+    prev_predictions, done_keys = _load_progress(results_dir, exp_name)
+    if done_keys:
+        print(f"    [断点续传] 已完成 {len(done_keys)} 条，从断点继续", flush=True)
+
+    all_predictions = list(prev_predictions)
+
     datasets = [
         (False, ag_dir, "AG"),
         (True,  hc_dir, "HC"),
     ]
     for is_hc, data_dir, ds_label in datasets:
+        json_files = sorted(
+            [f for f in os.listdir(data_dir) if f.endswith(".json")],
+            key=lambda x: int("".join(filter(str.isdigit, x)) or 0),
+        )
+
+        # 找出该数据集中尚未完成的文件
+        pending_files = set()
+        for jf in json_files:
+            if f"{ds_label}/{jf}" not in done_keys:
+                pending_files.add(jf)
+
+        if not pending_files:
+            print(f"    {ds_label}/{method}: 全部已完成，跳过", flush=True)
+            continue
+
         log_path = os.path.join(exp_log_dir, f"{ds_label}_{method}.txt")
-        print(f"    {ds_label}/{method} (no_gt={no_gt}) ...", flush=True)
+        print(f"    {ds_label}/{method} (no_gt={no_gt}, pending={len(pending_files)}/{len(json_files)}) ...", flush=True)
+
+        # baseline 方法按目录跑，用 skip_files 跳过已完成的
+        skip = set(jf for jf in json_files if jf not in pending_files)
 
         tracker.reset()
         buf = io.StringIO()
@@ -317,24 +407,26 @@ def run_baseline_experiment(exp_name, ag_dir, hc_dir, cfg, results_dir, logs_dir
                 max_tokens=1024,
                 no_ground_truth=no_gt,
                 test_mode=False,
-                skip_files=set(),
+                skip_files=skip,
             )
         output_text = buf.getvalue()
-        with open(log_path, "w", encoding="utf-8") as f:
+
+        # 追加模式写 log（续传时不覆盖之前的输出）
+        write_mode = "a" if os.path.exists(log_path) and skip else "w"
+        with open(log_path, write_mode, encoding="utf-8") as f:
             f.write(output_text)
 
         baseline_preds = _parse_baseline_predictions(log_path)
 
-        json_files = sorted(
-            [f for f in os.listdir(data_dir) if f.endswith(".json")],
-            key=lambda x: int("".join(filter(str.isdigit, x)) or 0),
-        )
-        n_samples = len(json_files)
-        per_sample_prompt = tracker.prompt_tokens // max(n_samples, 1)
-        per_sample_completion = tracker.completion_tokens // max(n_samples, 1)
-        per_sample_calls = tracker.call_count / max(n_samples, 1)
+        n_new = len(pending_files)
+        per_sample_prompt = tracker.prompt_tokens // max(n_new, 1)
+        per_sample_completion = tracker.completion_tokens // max(n_new, 1)
+        per_sample_calls = tracker.call_count / max(n_new, 1)
 
         for jf in json_files:
+            if f"{ds_label}/{jf}" in done_keys:
+                continue
+
             with open(os.path.join(data_dir, jf), "r", encoding="utf-8") as f:
                 sample_data = json.load(f)
             true_agent = sample_data.get("mistake_agent", "")
@@ -377,6 +469,7 @@ def run_baseline_experiment(exp_name, ag_dir, hc_dir, cfg, results_dir, logs_dir
                 "agent_count": len(all_agents),
             }
             all_predictions.append(entry)
+            _append_progress(results_dir, exp_name, entry)
 
             a_ok = "✓" if pred_agent == true_agent else "✗"
             s_ok = "✓" if pred_step == true_step else "✗"
@@ -384,15 +477,22 @@ def run_baseline_experiment(exp_name, ag_dir, hc_dir, cfg, results_dir, logs_dir
             print(f"      {ds_label}/{jf}: {parsed} Agent:{a_ok} Step:{s_ok}", flush=True)
 
     metrics = compute_all_metrics(all_predictions)
+    strat = stratified_metrics(all_predictions)
     output = {
         "experiment": exp_name,
         "config": cfg,
         "metrics": metrics,
+        "stratified_metrics": strat,
         "per_sample": all_predictions,
     }
     out_path = os.path.join(results_dir, f"{exp_name}.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False, default=str)
+
+    # 全部完成后清理 progress 文件
+    ppath = _progress_path(results_dir, exp_name)
+    if os.path.exists(ppath):
+        os.remove(ppath)
 
     return metrics
 
@@ -414,8 +514,8 @@ def generate_summary(results_dir, experiments):
     if not all_metrics:
         return
 
-    header = "| 实验 | Agent Acc | Step Acc | Joint Acc | Top-3 Agent | MRR Agent | Step MAE | Avg Input Tok | Avg Output Tok |"
-    sep =    "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    header = "| 实验 | Agent Acc | Step Acc | Joint Acc | Top-3 Agent | Top-3 Step | MRR Agent | Step MAE | Avg Input Tok | Avg Output Tok |"
+    sep =    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
     rows = [header, sep]
     for exp, m in all_metrics.items():
         eff = m.get("efficiency", {})
@@ -427,6 +527,7 @@ def generate_summary(results_dir, experiments):
             f"| {m.get('step_accuracy',0):.2%} "
             f"| {m.get('joint_accuracy',0):.2%} "
             f"| {m.get('topk_agent_accuracy',{}).get('top3',0):.2%} "
+            f"| {m.get('topk_step_accuracy',{}).get('top3',0):.2%} "
             f"| {m.get('mrr_agent',0):.4f} "
             f"| {mae_str} "
             f"| {eff.get('avg_input_tokens',0):.0f} "
@@ -435,8 +536,12 @@ def generate_summary(results_dir, experiments):
 
     md = "\n".join(rows)
 
-    # 按 history_length 分桶的详细指标表
+    # 按 history_length 分桶，跨实验对比表
     strat_lines = ["\n## 按对话长度分桶（20步一区间）\n"]
+
+    # 收集所有实验的分桶数据
+    all_strat_data = {}
+    all_buckets = set()
     for exp in experiments:
         path = os.path.join(results_dir, f"{exp}.json")
         if not os.path.exists(path):
@@ -444,24 +549,46 @@ def generate_summary(results_dir, experiments):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         by_hl = data.get("stratified_metrics", {}).get("by_history_length", {})
-        if not by_hl:
-            continue
-        strat_lines.append(f"### {exp}\n")
-        strat_lines.append("| 区间 | N | Agent Acc | Step Acc | Joint Acc | Top-3 Agent | MRR Agent | Step MAE |")
-        strat_lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
-        for bucket, sm in sorted(by_hl.items(), key=lambda x: int(x[0].split("-")[0])):
-            mae_v = sm.get("step_mae")
-            mae_s = f"{mae_v:.2f}" if mae_v is not None else "-"
-            strat_lines.append(
-                f"| {bucket} | {sm.get('count',0)} "
-                f"| {sm.get('agent_accuracy',0):.2%} "
-                f"| {sm.get('step_accuracy',0):.2%} "
-                f"| {sm.get('joint_accuracy',0):.2%} "
-                f"| {sm.get('topk_agent_accuracy',{}).get('top3',0):.2%} "
-                f"| {sm.get('mrr_agent',0):.4f} "
-                f"| {mae_s} |"
-            )
-        strat_lines.append("")
+        if by_hl:
+            all_strat_data[exp] = by_hl
+            all_buckets |= set(by_hl.keys())
+
+    if all_strat_data:
+        sorted_buckets = sorted(all_buckets, key=lambda x: int(x.split("-")[0]))
+
+        # 为每个指标生成一个跨实验对比表
+        bucket_metrics = [
+            ("Agent Acc", lambda sm: f"{sm.get('agent_accuracy',0):.2%}"),
+            ("Step Acc", lambda sm: f"{sm.get('step_accuracy',0):.2%}"),
+            ("MRR Agent", lambda sm: f"{sm.get('mrr_agent',0):.4f}"),
+            ("Top-3 Agent", lambda sm: f"{sm.get('topk_agent_accuracy',{}).get('top3',0):.2%}"),
+            ("Top-3 Step", lambda sm: f"{sm.get('topk_step_accuracy',{}).get('top3',0):.2%}"),
+        ]
+
+        for metric_name, fmt_fn in bucket_metrics:
+            strat_lines.append(f"### {metric_name}\n")
+            header_cols = ["区间(N)"] + list(all_strat_data.keys())
+            strat_lines.append("| " + " | ".join(header_cols) + " |")
+            strat_lines.append("| " + " | ".join(["---"] * len(header_cols)) + " |")
+            for bucket in sorted_buckets:
+                row_vals = []
+                # 从第一个有该bucket的实验取N
+                n_val = 0
+                for exp in all_strat_data:
+                    sm = all_strat_data[exp].get(bucket, {})
+                    if sm.get("count", 0) > 0:
+                        n_val = sm["count"]
+                        break
+                row_vals.append(f"{bucket}({n_val})")
+                for exp in all_strat_data:
+                    sm = all_strat_data[exp].get(bucket, {})
+                    if sm:
+                        row_vals.append(fmt_fn(sm))
+                    else:
+                        row_vals.append("-")
+                strat_lines.append("| " + " | ".join(row_vals) + " |")
+            strat_lines.append("")
+
     strat_md = "\n".join(strat_lines)
 
     summary_path = os.path.join(results_dir, "summary.md")
@@ -556,11 +683,11 @@ def generate_figures(results_dir, experiments):
     fig.savefig(os.path.join(fig_dir, "1_core_metrics.png"), dpi=150)
     plt.close(fig)
 
-    # ── 图2: 排名指标 (Top-3 Agent / MRR Agent) ──
-    rank_keys = [("topk_agent_accuracy", "top3"), ("mrr_agent",)]
-    rank_labels = ["Top-3 Agent Acc", "MRR Agent"]
+    # ── 图2: 排名指标 (Top-3 Agent / Top-3 Step / MRR Agent) ──
+    rank_keys = [("topk_agent_accuracy", "top3"), ("topk_step_accuracy", "top3"), ("mrr_agent",)]
+    rank_labels = ["Top-3 Agent Acc", "Top-3 Step Acc", "MRR Agent"]
 
-    fig, ax = plt.subplots(figsize=(max(8, len(labels) * 1.0), 5))
+    fig, ax = plt.subplots(figsize=(max(10, len(labels) * 1.2), 5))
     x2 = np.arange(len(rank_keys))
     for i, lab in enumerate(labels):
         vals = [_get(lab, *rk) for rk in rank_keys]
@@ -707,6 +834,71 @@ def generate_figures(results_dir, experiments):
         fig.savefig(os.path.join(fig_dir, "6_per_sample_heatmap.png"), dpi=150)
         plt.close(fig)
 
+    # ── 图7: 按对话长度分桶的跨实验对比 (5个子图) ──
+    all_strat_data = {}
+    all_buckets = set()
+    for exp in labels:
+        by_hl = all_data[exp].get("stratified_metrics", {}).get("by_history_length", {})
+        if by_hl:
+            all_strat_data[exp] = by_hl
+            all_buckets |= set(by_hl.keys())
+
+    if all_strat_data and all_buckets:
+        sorted_buckets = sorted(all_buckets, key=lambda x: int(x.split("-")[0]))
+        bucket_metric_defs = [
+            ("Agent Acc", lambda sm: sm.get("agent_accuracy", 0)),
+            ("Step Acc", lambda sm: sm.get("step_accuracy", 0)),
+            ("MRR Agent", lambda sm: sm.get("mrr_agent", 0)),
+            ("Top-3 Agent Acc", lambda sm: sm.get("topk_agent_accuracy", {}).get("top3", 0)),
+            ("Top-3 Step Acc", lambda sm: sm.get("topk_step_accuracy", {}).get("top3", 0)),
+        ]
+
+        n_metrics = len(bucket_metric_defs)
+        fig, axes = plt.subplots(n_metrics, 1, figsize=(max(12, len(sorted_buckets) * 2), 4 * n_metrics))
+        if n_metrics == 1:
+            axes = [axes]
+
+        exp_list = list(all_strat_data.keys())
+        x_b = np.arange(len(sorted_buckets))
+        w_b = 0.8 / max(len(exp_list), 1)
+
+        for ax_i, (m_name, m_fn) in enumerate(bucket_metric_defs):
+            ax = axes[ax_i]
+            for i, exp in enumerate(exp_list):
+                vals = []
+                for bucket in sorted_buckets:
+                    sm = all_strat_data[exp].get(bucket, {})
+                    vals.append(m_fn(sm) if sm else 0)
+                color = colors_map.get(exp, f"C{i}")
+                bars = ax.bar(x_b + i * w_b, vals, w_b, label=exp, color=color)
+                for bar, v in zip(bars, vals):
+                    if v > 0:
+                        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                                f"{v:.2f}", ha="center", va="bottom", fontsize=6)
+
+            # x轴标签包含样本数
+            bucket_labels = []
+            for bucket in sorted_buckets:
+                n_val = 0
+                for exp in exp_list:
+                    sm = all_strat_data[exp].get(bucket, {})
+                    if sm.get("count", 0) > 0:
+                        n_val = sm["count"]
+                        break
+                bucket_labels.append(f"{bucket}\n(n={n_val})")
+
+            ax.set_xticks(x_b + w_b * (len(exp_list) - 1) / 2)
+            ax.set_xticklabels(bucket_labels, fontsize=8)
+            ax.set_ylim(0, 1.15)
+            ax.set_ylabel(m_name)
+            ax.set_title(f"{m_name} by History Length Bucket")
+            ax.legend(fontsize=6, ncol=min(len(exp_list), 5), loc="upper right")
+
+        fig.suptitle("Metrics by History Length Bucket (20-step intervals)", fontsize=13, y=1.01)
+        fig.tight_layout()
+        fig.savefig(os.path.join(fig_dir, "7_bucket_metrics.png"), dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
     print(f"\n[可视化] 图表已保存到 {fig_dir}/")
     for f in sorted(os.listdir(fig_dir)):
         if f.endswith(".png"):
@@ -717,17 +909,36 @@ def generate_figures(results_dir, experiments):
 # 主入口
 # ============================================================
 
+def _is_experiment_complete(results_dir, exp_name):
+    """检查实验是否已完成：有结果JSON且无未完成的progress文件"""
+    result_path = os.path.join(results_dir, f"{exp_name}.json")
+    progress_path = _progress_path(results_dir, exp_name)
+    if not os.path.exists(result_path):
+        return False
+    # 有 progress 文件说明上次中断了，需要续传
+    if os.path.exists(progress_path):
+        return False
+    try:
+        with open(result_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return bool(data.get("metrics")) and len(data.get("per_sample", [])) > 0
+    except (json.JSONDecodeError, KeyError):
+        return False
+
+
 async def main():
-    parser = argparse.ArgumentParser(description="一键运行 9 组实验（采样数据）")
+    parser = argparse.ArgumentParser(description="一键运行实验（支持采样/全量/断点续传）")
     parser.add_argument("--experiments", nargs="+", default=ALL_EXPERIMENTS, choices=ALL_EXPERIMENTS,
                         help="要运行的实验列表 (默认全部)")
-    parser.add_argument("--n_ag", type=int, default=10, help="从 AG 采样的数量")
-    parser.add_argument("--n_hc", type=int, default=10, help="从 HC 采样的数量")
+    parser.add_argument("--n_ag", type=int, default=10, help="从 AG 采样的数量 (-1=全量)")
+    parser.add_argument("--n_hc", type=int, default=10, help="从 HC 采样的数量 (-1=全量)")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--resample", action="store_true", help="强制重新采样")
     parser.add_argument("--model", type=str, default="gpt-5.4-nano", help="模型名称")
     parser.add_argument("--run_id", type=str, default=None,
                         help="本次运行的 ID（默认自动生成时间戳，如 run_0327_1430）")
+    parser.add_argument("--force", action="store_true",
+                        help="强制重跑所有实验，忽略已有结果")
     args = parser.parse_args()
 
     run_id = args.run_id or datetime.now().strftime("run_%m%d_%H%M")
@@ -741,25 +952,44 @@ async def main():
     logger.remove()
     logger.add(os.path.join(logs_dir, "run.log"), level="DEBUG")
 
+    data_mode = "全量" if args.n_ag < 0 and args.n_hc < 0 else f"采样 AG={args.n_ag}, HC={args.n_hc}"
     print("=" * 60)
-    print(f"  测试实验 ({len(args.experiments)} 组)")
+    print(f"  实验 ({len(args.experiments)} 组)")
     print(f"  实验列表: {', '.join(args.experiments)}")
     print(f"  Run ID : {run_id}")
     print(f"  模型: {args.model}  种子: {args.seed}")
-    print(f"  采样: AG={args.n_ag}, HC={args.n_hc}")
+    print(f"  数据: {data_mode}")
     print(f"  输出: {run_dir}")
     print(f"  时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
-    print("\n[1] 采样数据")
-    ag_dir, hc_dir = sample_data(args.n_ag, args.n_hc, args.seed, args.resample, run_dir=str(run_dir))
+    print("\n[1] 准备数据")
+    ag_dir, hc_dir = sample_data(args.n_ag, args.n_hc, args.seed, args.resample,
+                                  run_dir=None if (args.n_ag < 0 and args.n_hc < 0) else str(run_dir))
 
     total = len(args.experiments)
     all_results = {}
+    skipped = []
     for exp_i, exp_name in enumerate(args.experiments, 1):
         cfg = EXPERIMENT_CONFIG[exp_name]
         print(f"\n{'─'*50}", flush=True)
         print(f"  [{exp_i}/{total}] {exp_name} ({cfg['type']})", flush=True)
+
+        # 实验级断点续传：已完成则跳过
+        if not args.force and _is_experiment_complete(results_dir, exp_name):
+            with open(os.path.join(results_dir, f"{exp_name}.json"), "r") as f:
+                data = json.load(f)
+            metrics = data["metrics"]
+            all_results[exp_name] = metrics
+            n_samples = len(data.get("per_sample", []))
+            skipped.append(exp_name)
+            print(f"  => {exp_name} SKIP (已完成, {n_samples}条) Agent:{metrics['agent_accuracy']:.2%} Step:{metrics['step_accuracy']:.2%}", flush=True)
+            continue
+
+        has_progress = os.path.exists(_progress_path(results_dir, exp_name))
+        if has_progress:
+            print(f"  => 检测到未完成的 progress 文件，断点续传...", flush=True)
+
         t0 = time.time()
         try:
             if cfg["type"] == "feedback":
@@ -771,6 +1001,9 @@ async def main():
             print(f"  => {exp_name} done ({elapsed:.1f}s) Agent:{metrics['agent_accuracy']:.2%} Step:{metrics['step_accuracy']:.2%} Joint:{metrics['joint_accuracy']:.2%}", flush=True)
         except Exception as e:
             print(f"  => {exp_name} FAILED: {e}", flush=True)
+
+    if skipped:
+        print(f"\n[断点续传] 跳过已完成的实验: {', '.join(skipped)}")
 
     generate_summary(results_dir, args.experiments)
     generate_figures(results_dir, args.experiments)

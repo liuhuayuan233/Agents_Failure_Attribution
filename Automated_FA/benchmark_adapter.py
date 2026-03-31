@@ -269,7 +269,6 @@ def _compress_execution_chain(chain: list) -> str:
     if len(chain) <= 20:
         return " → ".join(chain)
 
-    # 检测循环模式：找到最短重复单元
     for period in range(2, min(len(chain) // 2 + 1, 8)):
         pattern = chain[:period]
         count = 0
@@ -291,7 +290,6 @@ def _compress_execution_chain(chain: list) -> str:
                     result += f" → {' → '.join(remainder)}"
             return result
 
-    # 无明显循环，截断显示
     head = " → ".join(chain[:10])
     tail = " → ".join(chain[-5:])
     return f"{head} → ... ({len(chain)} steps total) ... → {tail}"
